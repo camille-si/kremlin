@@ -20,6 +20,15 @@ let build_def_map files =
         ()
   )
 
+(* A set of hints to pick better names for monomorphized data types. Filled by
+ * Inlining.ml. *)
+let hints: ((lident * typ list) * lident) list ref = ref []
+
+let debug_hints () =
+  KPrint.bprintf "==== state of naming hints ====\n";
+  List.iter (fun ((hd, args), lid) ->
+    KPrint.bprintf "%a --> %a\n" ptyp (TApp (hd, args)) plid lid
+  ) !hints
 
 
 (* We visit type declarations in order to monomorphize parameterized type
@@ -89,14 +98,14 @@ let monomorphize_data_types map = object(self)
     let lid, args = n in
     if List.length args > 0 then
       try
-        let pretty = List.assoc n !NamingHints.hints in
+        let pretty = List.assoc n !hints in
         if Options.debug "names" then
           KPrint.bprintf "Hit: %a --> %a\n" ptyp (TApp (lid, args)) plid pretty;
         pretty
       with Not_found ->
         if Options.debug "names" then begin
           KPrint.bprintf "No hit: %a\n" ptyp (TApp (lid, args));
-          NamingHints.debug ()
+          debug_hints ()
         end;
         let doc = PPrint.(separate_map underscore PrintAst.print_typ args) in
         fst lid, KPrint.bsprintf "%s__%a" (snd lid) PrintCommon.pdoc doc
@@ -123,7 +132,7 @@ let monomorphize_data_types map = object(self)
          * allocated, including the current node's (in case this is a
          * recursive type). Cannot use the current visitor because it would
          * force visiting sub-nodes that we don't intend to visit yet. *)
-        NamingHints.hints := List.map (fun ((hd, args), lid) ->
+        hints := List.map (fun ((hd, args), lid) ->
           (hd, List.map (
             (object
               inherit [_] map as self'
@@ -144,7 +153,7 @@ let monomorphize_data_types map = object(self)
                   let args = List.map (self'#visit_typ ()) args in
                   TTuple args
             end)#visit_typ ()
-          ) args), lid) !NamingHints.hints;
+          ) args), lid) !hints;
 
         (* Subtletly: we decline to insert type monomorphizations in dropped
          * files, on the basis that they might be needed later in an actual
@@ -363,7 +372,7 @@ let functions files =
           end
 
       | EOp ((K.Eq | K.Neq), _) ->
-          assert false
+          ETApp (e, ts)
 
       | EOp (_, _) ->
          (self#visit_expr env e).node
@@ -385,24 +394,9 @@ let equalities files =
     | _ -> ()
   ) in
 
-  (* I first tried carrying over the map from DataTypes to here, but this map is
-     invalidated by the call to GcTypes which results in stale data type definitions
-     being left in the map. So, we anticipate a little bit on the result of
-     DataTypes.everything here, and just replicate the logic to determine
-     whether this is going to end up being an enum or not. *)
-  let enum_eventually lid =
-    match Hashtbl.find types_map lid with
-    | exception Not_found ->
-        false
-    | Variant branches ->
-        List.for_all (fun (_, fields) -> List.length fields = 0) branches
-    | _ ->
-        false
-  in
-
   let monomorphize = object(self)
 
-    inherit [_] map as _super
+    inherit [_] map as super
 
     val mutable current_file = ""
     val mutable has_cycle = false
@@ -436,9 +430,10 @@ let equalities files =
      * equality predicate that implements F*'s structural equality. *)
     method private generate_equality t op =
       (* A set of helpers use for generating abstract syntax. *)
-      let eq_lid = match op with
-        | K.PEq -> [], "__eq"
-        | K.PNeq -> [], "__neq"
+      let eq_kind, eq_lid = match op with
+        | K.Eq -> `Eq, ([], "__eq")
+        | K.Neq -> `Neq, ([], "__neq")
+        | _ -> assert false
       in
       let eq_typ = TArrow (t, TArrow (t, TBool)) in
       let instance_lid = Gen.gen_lid eq_lid [ t ] in
@@ -447,22 +442,19 @@ let equalities files =
 
       match t with
       | TQualified ([ "Prims" ], ("int" | "nat" | "pos")) ->
-          EOp (K.op_of_poly_comp op, K.CInt)
-
-      | TQualified lid when enum_eventually lid ->
-          EPolyComp (op, t)
+          EOp (op, K.CInt)
 
       | TInt w ->
-          EOp (K.op_of_poly_comp op, w)
+          EOp (op, w)
 
       | TBool ->
-          EOp (K.op_of_poly_comp op, K.Bool)
+          EOp (op, K.Bool)
 
       | TBuf _ ->
-          (* 20210205: I don't think this is allowed anymore, at all. Maybe with
-             Steel we'll have raw pointer comparison? Leaving it here just in
-             case. *)
-          EPolyComp (op, t)
+          (* Buffers do not have eqtype. The only instance of pointer types compared via equality is
+           * thus references, which are compared by address. Type-checking is lax and will accept
+           * this even though the K.Bool is incorrect... *)
+          EOp (op, K.UInt64)
 
       | TQualified lid when Hashtbl.mem types_map lid ->
           begin try
@@ -474,9 +466,9 @@ let equalities files =
             EQualified existing_lid
           with Not_found ->
             let mk_conj_or_disj es =
-              match op with
-              | K.PEq -> List.fold_left mk_and etrue es
-              | K.PNeq -> List.fold_left mk_or efalse es
+              match eq_kind with
+              | `Eq -> List.fold_left mk_and etrue es
+              | `Neq -> List.fold_left mk_or efalse es
             in
             let mk_rec_equality t e1 e2 =
               match t with
@@ -519,9 +511,9 @@ let equalities files =
                 EQualified (Gen.register_def current_file eq_lid [ t ] instance_lid def)
             | Variant branches ->
                 let def () =
-                  let fail_case = match op with
-                    | K.PEq -> efalse
-                    | K.PNeq -> etrue
+                  let fail_case = match eq_kind with
+                    | `Eq -> efalse
+                    | `Neq -> etrue
                   in
                   (* let __eq__typ y x = *)
                   DFunction (None, [ Common.Private ], 0, TBool, instance_lid, [ y; x ],
@@ -535,7 +527,7 @@ let equalities files =
                           fresh_binder (KPrint.bsprintf "x_%s" f) t
                         ) fields in
                         (* \. xn ... x0. *)
-                        List.rev binders_x,
+                        List.rev binders_x, 
                         (* A x0 ... xn -> *)
                         with_type t (PCons (cons, List.mapi (fun i (_, (t_f, _)) ->
                           with_type t_f (PBound i)) fields)),
@@ -575,33 +567,42 @@ let equalities files =
             EQualified (Hashtbl.find Gen.generated_lids (eq_lid, [ t ]))
           with Not_found ->
             (* External type without a definition. Comparison of function types? *)
-            begin match op with
-            | K.PNeq ->
+            begin match eq_kind with
+            | `Neq ->
                 (* let __neq__t x y = not (__eq__t x y) *)
                 let def () =
                   let body = mk_not (with_type TBool (
-                    EApp (with_type eq_typ (self#generate_equality t K.PEq), [
+                    EApp (with_type eq_typ (self#generate_equality t K.Eq), [
                       with_type t (EBound 0); with_type t (EBound 1) ])))
                   in
                   DFunction (None, [], 0, TBool, instance_lid, [ y; x ], body)
                 in
                 EQualified (Gen.register_def current_file eq_lid [ t ] instance_lid def)
-            | K.PEq ->
+            | `Eq ->
                 (* assume val __eq__t: t -> t -> bool *)
                 let def () = DExternal (None, [], instance_lid, eq_typ, [ "x"; "y" ]) in
                 EQualified (Gen.register_def current_file eq_lid [ t ] instance_lid def)
             end
 
-    (* New feature (somewhat unrelated to polymorphic equality
-     * monomorphization): generate top-level specialized equalities in case a
+    method! visit_ETApp _ e ts =
+      match e.node with
+      | EOp (K.Eq | K.Neq as op, _) ->
+          let t = KList.one ts in
+          self#generate_equality t op
+      | _ ->
+          failwith "should've been eliminated by Monomorphize.functions"
+
+    (* New feature: generate top-level specialized equalities in case a
      * higher-order occurrence of the equality operator occurs, at a scalar
      * type. *)
 
-    method private eta_expand_op c t =
-      let eq_lid = match c with
-        | K.PEq -> [], "__eq"
-        | K.PNeq -> [], "__neq"
+    method private eta_expand_op op w =
+      let eq_lid = match op with
+        | K.Eq -> [], "__eq"
+        | K.Neq -> [], "__neq"
+        | _ -> assert false
       in
+      let t = TInt w in
       try
         (* Already monomorphized? *)
         let existing_lid = Hashtbl.find Gen.generated_lids (eq_lid, [ t ]) in
@@ -611,26 +612,27 @@ let equalities files =
         let instance_lid = Gen.gen_lid eq_lid [ t ] in
         let x = fresh_binder "x" t in
         let y = fresh_binder "y" t in
-        EQualified (Gen.register_def current_file eq_lid [ t ] instance_lid (fun _ ->
+        EQualified (Gen.register_def current_file eq_lid [ TInt w ] instance_lid (fun _ ->
           DFunction (None, [ Common.Private ], 0, TBool, instance_lid, [ y; x ],
             with_type TBool (
-              EApp (with_type eq_typ (EPolyComp (c, t)), [
+              EApp (with_type eq_typ (EOp (op, w)), [
                 with_type t (EBound 0); with_type t (EBound 1) ])))))
 
     method! visit_EApp env e es =
       match e.node with
-      | EPolyComp (op, t) ->
-          EApp (with_type e.typ (self#generate_equality t op), List.map (self#visit_expr env) es)
-      | _ ->
-          EApp (self#visit_expr env e, List.map (self#visit_expr env) es)
+      | EOp ((K.Eq | K.Neq), _) -> EApp (e, List.map (self#visit_expr env) es)
+      | _ -> super#visit_EApp env e es
 
-    method! visit_EPolyComp _ c t =
-      (* We are NOT under an application, meaning this is an unapplied equality
-         stemming from a higher-order usage of a monomorphic equality operator.
-         We perform something similar to `generate_equality` above, namely, we
-         register a top-level function that "fills in" for this equality
-         function. *)
-      self#eta_expand_op c t
+    method! visit_EOp _ op w =
+      match op with
+      | K.Eq | K.Neq ->
+          (* If we get here, then this is an unapplied equality appearing in an
+           * expression, which then needs to be hoisted into an eta-expanded
+           * top-level definition. Note that we will still bail on partial
+           * applications of the equality. *)
+          self#eta_expand_op op w
+      | _ ->
+          EOp (op, w)
 
   end in
 

@@ -8,7 +8,7 @@ module U32 = FStar.UInt32
 
 open FStar.HyperStack.ST
 
-#set-options "--__no_positivity"
+#set-options "--__no_positivity --use_two_phase_tc true"
 
 /// We revisit the classic example of lists, but in a low-level setting, using
 /// linked lists. This first version uses `ref`, the type of references that are

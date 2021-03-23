@@ -70,7 +70,6 @@ let rec merge' (env: env) (u: S.t) (e: expr): S.t * S.t * expr =
   | EString _
   | EAny
   | EOp _
-  | EPolyComp _
   | EPushFrame
   | EPopFrame
   | EEnum _
